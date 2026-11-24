@@ -169,6 +169,31 @@ dialog::backdrop{background:rgba(15,23,42,.45); backdrop-filter:blur(2px);}
 .preview-list table{width:100%; border-collapse:collapse; font-size:12.5px;}
 .preview-list th,.preview-list td{border-bottom:1px solid var(--line); padding:5px 8px; text-align:left; white-space:nowrap;}
 .preview-list td.wrap{white-space:normal;}
+/* ---------- JSON 导入 ---------- */
+.json-row{display:flex; align-items:center; gap:8px; flex-wrap:wrap;}
+.json-preview{margin-top:12px; border:1px solid var(--line); border-radius:10px; padding:12px; background:#fff;}
+.json-head{display:flex; flex-direction:column; gap:8px; margin-bottom:10px;}
+.json-row2{display:flex; align-items:center; gap:12px; flex-wrap:wrap; font-size:13px;}
+.json-label{color:var(--muted); min-width:64px;}
+.json-stats{display:flex; gap:8px; flex-wrap:wrap; margin:8px 0;}
+.json-stats .badge{font-size:12px; padding:2px 9px; border-radius:999px; border:1px solid var(--line2);}
+.badge.add{background:#ecfdf5; color:#065f46; border-color:#a7f3d0;}
+.badge.mod{background:#fffbeb; color:#92400e; border-color:#fde68a;}
+.badge.del{background:#fef2f2; color:#991b1b; border-color:#fecaca;}
+.badge.same{background:#f8fafc; color:#475569;}
+.badge.warn{background:#faf5ff; color:#6b21a8; border-color:#e9d5ff;}
+.json-sec{margin:10px 0;}
+.json-sec-title{font-size:12.5px; font-weight:700; margin-bottom:4px;}
+.json-sec-title.add{color:#047857;} .json-sec-title.mod{color:#b45309;}
+.json-sec-title.del{color:#b91c1c;} .json-sec-title.warn{color:#6b21a8;}
+.json-list{margin:4px 0 0; padding-left:18px; font-size:12.5px; max-height:180px; overflow:auto;}
+.json-list li{margin:2px 0;}
+.json-list li.add{color:#065f46;}
+.json-list li.del{color:#991b1b;}
+.json-list li.mod{color:#92400e;}
+.json-actions{display:flex; justify-content:flex-end; gap:8px; margin-top:12px;}
+.json-errors{margin-top:10px; border:1px solid #fecaca; background:#fef2f2; border-radius:8px; padding:10px;}
+.json-err-title{color:#b91c1c; font-weight:700; font-size:13px; margin-bottom:6px;}
 
 /* toast */
 .toast-wrap{position:fixed; right:18px; bottom:18px; display:flex; flex-direction:column; gap:8px; z-index:200;}
