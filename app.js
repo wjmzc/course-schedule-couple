@@ -477,6 +477,7 @@ function altShortLabel(){
 
 /* ---------- 状态 ---------- */
 const STORE_KEY = 'courseScheduleApp.v1';
+const JSON_BACKUP_KEY = 'courseScheduleApp.importBackup.v1';
 let state = {
   totalWeeks: 20,
   startDate: '',          // 开学第一周周一，用于算“本周”
@@ -858,6 +859,7 @@ function loadSample(){
 let importState = null; // { rows, hasHeader, mapping }
 let pendingCourses = [];
 let pendingErrors = [];
+let jsonPending = null;  // { courses, meta, slot, diff }
 
 function resetImportUI(){
   importState = null; pendingCourses = []; pendingErrors = [];
@@ -866,12 +868,17 @@ function resetImportUI(){
   $('mappingArea').innerHTML = '';
   $('previewArea').innerHTML = '';
   $('replaceFirst').checked = false;
+  jsonPending = null;
+  const jp = $('jsonPreview'); if(jp){ jp.hidden = true; jp.innerHTML = ''; }
+  const je = $('jsonErrors'); if(je){ je.hidden = true; je.innerHTML = ''; }
 }
 
 function switchImportTab(tab){
   document.querySelectorAll('#importTabs .tab').forEach(t=>t.classList.toggle('active', t.dataset.tab===tab));
   $('panel-paste').hidden = tab!=='paste';
   $('panel-file').hidden = tab!=='file';
+  const jp = $('panel-json'); if(jp) jp.hidden = tab!=='json';
+  if(tab==='json'){ $('importStep2').hidden = true; $('importFoot').hidden = true; }
 }
 
 function currentSrcMode(){
@@ -1090,18 +1097,367 @@ function importBackupFile(file){
       }
       if(!confirm('确定恢复吗？将覆盖【'+(slot===1?'我的':'对象')+'】当前的课表。')) return;
       const list = (s.courses||[]).map(normCourse);
-      if(slot===1) state.courses = list; else state.courses2 = list;
+      // 覆盖前备份当前槽位；备份失败则阻止覆盖
+      try{
+        backupSlotBeforeWrite(slot);
+      }catch(e){
+        toast('无法创建覆盖前备份，已取消恢复：' + (e && e.message ? e.message : e), 'err');
+        return;
+      }
+      const prevState = JSON.parse(JSON.stringify(state));
       state.totalWeeks = clampInt(s.totalWeeks, 1, 40, state.totalWeeks);
       if(Array.isArray(s.periods) && s.periods.length) state.periods = s.periods;
       if(Array.isArray(s.periodsAlt) && s.periodsAlt.length) state.periodsAlt = s.periodsAlt;
       if(typeof s.altBuildings==='string' && s.altBuildings.trim()) state.altBuildings = s.altBuildings;
       if(s.startDate) state.startDate = s.startDate;
-      save(); renderAll();
+      const res = persistSlotChange(slot, list);
+      if(!res.ok){
+        state = prevState;
+        let restored = false, restoreError = null;
+        try{ localStorage.setItem(STORE_KEY, JSON.stringify(state)); restored = true; }
+        catch(e2){ restoreError = e2; }
+        renderAll();
+        if(restored){
+          toast('恢复失败，已恢复原数据：' + (res.error && res.error.message ? res.error.message : res.error), 'err');
+        }else{
+          toast('恢复失败，且自动回滚失败！本地存储可能仍是新数据；覆盖前备份已保存在浏览器中，请勿刷新页面，先导出备份或从覆盖前备份恢复。原始错误：'
+            + (res.error && res.error.message ? res.error.message : res.error)
+            + '；回滚错误：' + (restoreError && restoreError.message ? restoreError.message : restoreError), 'err');
+        }
+        return;
+      }
+      renderAll();
       toast('已恢复到【'+(slot===1?'我的':'对象')+'】课表（'+list.length+' 门课）');
     }catch(e){
       toast('恢复失败：'+(e&&e.message?e.message:e),'err');
     }
   });
+}
+
+/* ---------- JSON 导入：校验 → 差异预览 → 分槽写入 ---------- */
+const JSON_MAX_COURSES = 500;
+
+function slotCourses(slot){ return slot===2 ? state.courses2 : state.courses; }
+function setSlotCourses(slot, list){ if(slot===2) state.courses2 = list; else state.courses = list; }
+
+// 写入前把所选槽位备份到独立键；失败时抛出，由调用方决定是否继续
+function backupSlotBeforeWrite(slot){
+  const list = slot===2 ? state.courses2 : state.courses;
+  localStorage.setItem(JSON_BACKUP_KEY, JSON.stringify({
+    savedAt: new Date().toISOString(),
+    slot,
+    courses: (list||[]).map(c=> Object.assign({}, c))
+  }));
+}
+
+// 写入所选槽位；失败时回滚，并如实返回回滚是否成功
+function persistSlotChange(slot, nextList){
+  const prev = slot===2 ? state.courses2 : state.courses;
+  try{
+    setSlotCourses(slot, nextList);
+    localStorage.setItem(STORE_KEY, JSON.stringify(state));
+    return { ok:true };
+  }catch(e){
+    setSlotCourses(slot, prev);
+    let restored = false, restoreError = null;
+    try{
+      localStorage.setItem(STORE_KEY, JSON.stringify(state));
+      restored = true;
+    }catch(e2){ restoreError = e2; }
+    return { ok:false, error:e, restored, restoreError };
+  }
+}
+
+// 找出 weeksRaw 中超出 [1, totalWeeks] 的周次（不改变 parseWeeksText 的既有行为）
+function findOutOfRangeWeeks(weeksRaw, totalWeeks){
+  const raw = String(weeksRaw==null ? '' : weeksRaw);
+  if(!raw) return [];
+  const bad = new Set();
+  const rangeRe = /(\d+)\s*-\s*(\d+)/g;
+  let m;
+  while((m = rangeRe.exec(raw))){
+    const a = Number(m[1]), b = Number(m[2]);
+    if(a < 1 || a > totalWeeks) bad.add(a);
+    if(b < 1 || b > totalWeeks) bad.add(b);
+  }
+  const rest = raw.replace(/(\d+)\s*-\s*(\d+)/g, ' ');
+  const numRe = /\d+/g;
+  while((m = numRe.exec(rest))){
+    const n = Number(m[0]);
+    if(n < 1 || n > totalWeeks) bad.add(n);
+  }
+  return Array.from(bad).sort((x,y)=> x-y);
+}
+
+// 支持三种输入：课程数组 / {courses:[...]} / 课表备份 {state:{courses:[...]}}
+function extractJsonCourses(data){
+  if(Array.isArray(data)) return { courses:data, meta:{} };
+  if(data && Array.isArray(data.courses)) return { courses:data.courses, meta:{ type:data.type||'', term:data.term||'' } };
+  if(data && data.state && Array.isArray(data.state.courses))
+    return { courses:data.state.courses, meta:{ type:'backup', term:'', totalWeeks:data.state.totalWeeks } };
+  return null;
+}
+
+// 严格校验，任何一条不合法都整体拒绝
+function validateImportCourses(list, totalWeeks){
+  const out = [], errors = [];
+  if(!Array.isArray(list)) return { ok:false, courses:[], errors:['JSON 不是课程数组'] };
+  if(!list.length) return { ok:false, courses:[], errors:['JSON 中没有课程数据'] };
+  if(list.length > JSON_MAX_COURSES) return { ok:false, courses:[], errors:['课程数量过多（上限 '+JSON_MAX_COURSES+' 条）'] };
+  list.forEach((raw, i)=>{
+    const p = '第 ' + (i+1) + ' 条';
+    const errs = [];
+    if(!raw || typeof raw !== 'object' || Array.isArray(raw)){ errors.push(p + '：不是一个课程对象'); return; }
+    const name = String(raw.name==null ? '' : raw.name).trim();
+    if(!name) errs.push('缺少课程名称 name');
+    else if(name.length > 100) errs.push('课程名称过长');
+    const day = Number(raw.day);
+    if(!Number.isInteger(day) || day < 1 || day > 7) errs.push('星期 day 必须是 1-7 的整数');
+    const start = Number(raw.start);
+    const end = raw.end==null ? start : Number(raw.end);
+    if(!Number.isInteger(start) || start < 1 || start > 30) errs.push('节次 start 必须是 1-30 的整数');
+    if(!Number.isInteger(end) || end < 1 || end > 30) errs.push('节次 end 必须是 1-30 的整数');
+    if(Number.isInteger(start) && Number.isInteger(end) && end < start) errs.push('end 不能小于 start');
+    const weeksRaw = raw.weeksRaw==null ? '' : String(raw.weeksRaw).trim();
+    const wk = parseWeeksText(weeksRaw, totalWeeks);
+    const badWeeks = findOutOfRangeWeeks(weeksRaw, totalWeeks);
+    if(!wk.ok){
+      if(badWeeks.length) errs.push('周次超出范围（本学期共 ' + totalWeeks + ' 周）：' + badWeeks.join('、'));
+      else errs.push('周次无法识别「' + weeksRaw + '」');
+    }else if(badWeeks.length){
+      errs.push('周次超出范围（本学期共 ' + totalWeeks + ' 周）：' + badWeeks.join('、'));
+    }
+    const location = raw.location==null ? '' : String(raw.location).trim();
+    const teacher = raw.teacher==null ? '' : String(raw.teacher).trim();
+    if(location.length > 100) errs.push('地点过长');
+    if(teacher.length > 100) errs.push('教师过长');
+    if(errs.length){ errors.push(p + '：' + errs.join('；')); return; }
+    const ci = Number(raw.color);
+    out.push({
+      name, teacher, location, day, start, end, weeksRaw,
+      color: Number.isInteger(ci) ? Math.max(0, Math.min(PALETTE.length-1, ci)) : colorIndex(name)
+    });
+  });
+  return { ok: errors.length === 0, courses: out, errors };
+}
+
+// 稳定的“课程身份”：name + day + start + end（不含会变的教室/周次/教师）
+function jsonIdentity(c){ return [String(c.name||'').trim(), c.day, c.start, c.end].join('|'); }
+function sameCourseAttrs(a, b){
+  return (a.location||'') === (b.location||'')
+    && (a.weeksRaw||'') === (b.weeksRaw||'')
+    && (a.teacher||'') === (b.teacher||'');
+}
+
+function diffCourseLists(oldList, newList){
+  const groups = new Map();
+  const add = (list, side)=>{
+    for(const c of list){
+      const k = jsonIdentity(c);
+      if(!groups.has(k)) groups.set(k, { old:[], next:[] });
+      groups.get(k)[side].push(c);
+    }
+  };
+  add(oldList, 'old'); add(newList, 'next');
+  const res = { added:[], removed:[], changed:[], unchanged:[], uncertain:[] };
+  for(const g of groups.values()){
+    const o = g.old, n = g.next;
+    if(!o.length){ n.forEach(c=>res.added.push(c)); continue; }
+    if(!n.length){ o.forEach(c=>res.removed.push(c)); continue; }
+    if(o.length===1 && n.length===1){
+      if(sameCourseAttrs(o[0], n[0])) res.unchanged.push({ before:o[0], after:n[0] });
+      else res.changed.push({ before:o[0], after:n[0] });
+      continue;
+    }
+    // 同一身份有多条：只按“教室+周次+教师”完全一致配对，其余标为待确认
+    const usedO = new Set(), usedN = new Set();
+    n.forEach((nc, ni)=>{
+      const oi = o.findIndex((oc, i2)=> !usedO.has(i2) && sameCourseAttrs(oc, nc));
+      if(oi >= 0){ usedO.add(oi); usedN.add(ni); res.unchanged.push({ before:o[oi], after:nc }); }
+    });
+    o.forEach((oc, i2)=>{ if(!usedO.has(i2)) res.uncertain.push({ side:'old', course:oc }); });
+    n.forEach((nc, ni)=>{ if(!usedN.has(ni)) res.uncertain.push({ side:'next', course:nc }); });
+  }
+  return res;
+}
+
+function jsonCourseLine(c){
+  return DAY_NAMES[c.day-1] + ' 第' + c.start + (c.end>c.start ? '-'+c.end : '') + '节 · ' + c.name
+    + (c.location ? ' · 📍' + c.location : '')
+    + (c.weeksRaw ? ' · 🗓' + c.weeksRaw : '');
+}
+function jsonFieldDiff(before, after){
+  const parts = [];
+  if((before.location||'') !== (after.location||''))
+    parts.push('教室 ' + (before.location||'—') + ' → ' + (after.location||'—'));
+  if((before.weeksRaw||'') !== (after.weeksRaw||''))
+    parts.push('周次 ' + (before.weeksRaw||'全周') + ' → ' + (after.weeksRaw||'全周'));
+  if((before.teacher||'') !== (after.teacher||''))
+    parts.push('教师 ' + (before.teacher||'—') + ' → ' + (after.teacher||'—'));
+  return parts.join('；') || '属性未变化';
+}
+
+function showJsonErrors(errs){
+  const box = $('jsonErrors'); if(!box) return;
+  const list = (errs||[]).slice(0, 40).map(e=>'<li class="del">' + esc(e) + '</li>').join('');
+  box.innerHTML = '<div class="json-err-title">❌ JSON 校验未通过，未写入任何数据</div>'
+    + '<ul class="json-list">' + list + '</ul>'
+    + ((errs||[]).length > 40 ? '<p class="help">…… 还有 ' + (errs.length-40) + ' 条</p>' : '');
+  box.hidden = false;
+}
+
+function analyzeJsonText(text){
+  const box = $('jsonErrors');
+  if(box){ box.hidden = true; box.innerHTML = ''; }
+  const pv = $('jsonPreview'); if(pv){ pv.hidden = true; pv.innerHTML = ''; }
+  jsonPending = null;
+  const raw = String(text==null ? '' : text).trim();
+  if(!raw){ toast('请先粘贴 JSON 或选择 JSON 文件','warn'); return; }
+  let data;
+  try{ data = JSON.parse(raw); }
+  catch(e){ showJsonErrors(['JSON 格式错误：' + (e && e.message ? e.message : e)]); return; }
+  const extracted = extractJsonCourses(data);
+  if(!extracted){
+    showJsonErrors(['无法识别的 JSON：需要是课程数组、{"courses":[…]} 或课表备份 {"state":{"courses":[…]}}']);
+    return;
+  }
+  const total = clampInt(extracted.meta.totalWeeks, 1, 40, state.totalWeeks);
+  const res = validateImportCourses(extracted.courses, total);
+  if(!res.ok){ showJsonErrors(res.errors); return; }
+  jsonPending = {
+    courses: res.courses,
+    meta: extracted.meta,
+    slot: 1,
+    diff: diffCourseLists(state.courses, res.courses)
+  };
+  renderJsonPreview();
+}
+
+function renderJsonPreview(){
+  const p = jsonPending; const box = $('jsonPreview');
+  if(!p || !box) return;
+  const d = p.diff;
+  const slotName = p.slot===2 ? '对象课表' : '我的课表';
+  const MAX = 50;
+  const listHtml = (title, cls, items, fmt)=>{
+    if(!items.length) return '';
+    let h = '<div class="json-sec"><div class="json-sec-title ' + cls + '">' + title + '（' + items.length + '）</div><ul class="json-list">';
+    items.slice(0, MAX).forEach(it=>{ h += '<li class="' + (cls==='warn'?'':cls) + '">' + esc(fmt(it)) + '</li>'; });
+    if(items.length > MAX) h += '<li class="muted">…… 仅显示前 ' + MAX + ' 条</li>';
+    return h + '</ul></div>';
+  };
+  let html = '<div class="json-head">'
+    + '<div class="json-row2"><span class="json-label">写入课表</span>'
+    + '<label class="radio"><input type="radio" name="jsonSlot" value="1"' + (p.slot===1?' checked':'') + '> 我的</label>'
+    + '<label class="radio"><input type="radio" name="jsonSlot" value="2"' + (p.slot===2?' checked':'') + '> 对象</label>'
+    + '</div>'
+    + '<div class="json-row2"><span class="json-label">写入方式</span>'
+    + '<label class="radio"><input type="radio" name="jsonMode" value="merge" checked> 新增/更新（安全，不删除）</label>'
+    + '<label class="radio"><input type="radio" name="jsonMode" value="replace"> 整体替换该课表（会删除未出现的课）</label>'
+    + '</div></div>';
+  html += '<div class="json-stats">'
+    + '<span class="badge add">新增 ' + d.added.length + '</span>'
+    + '<span class="badge mod">修改 ' + d.changed.length + '</span>'
+    + '<span class="badge del">删除 ' + d.removed.length + '</span>'
+    + '<span class="badge same">不变 ' + d.unchanged.length + '</span>'
+    + (d.uncertain.length ? '<span class="badge warn">待确认 ' + d.uncertain.length + '</span>' : '')
+    + '</div>';
+  html += listHtml('新增课程', 'add', d.added, c=> jsonCourseLine(c));
+  html += listHtml('修改课程', 'mod', d.changed, it=> jsonCourseLine(it.after) + '　【' + jsonFieldDiff(it.before, it.after) + '】');
+  html += listHtml('将被删除（仅整体替换时生效）', 'del', d.removed, c=> jsonCourseLine(c));
+  html += listHtml('无法可靠匹配（不会自动删除或覆盖）', 'warn', d.uncertain,
+    it=> jsonCourseLine(it.course) + '　【' + (it.side==='old' ? '仅现有数据' : '仅新数据') + '】');
+  if(!d.added.length && !d.changed.length && !d.removed.length){
+    html += '<p class="help">与当前【' + slotName + '】完全一致，没有需要写入的变化。</p>';
+  }
+  html += '<div class="json-actions">'
+    + '<button class="btn" id="btnJsonCancel">取消</button>'
+    + '<button class="btn primary" id="btnJsonApply">✅ 确认写入【' + slotName + '】</button>'
+    + '</div>';
+  box.innerHTML = html;
+  box.hidden = false;
+
+  box.querySelectorAll('input[name="jsonSlot"]').forEach(r=>{
+    r.addEventListener('change', ev=>{
+      jsonPending.slot = Number(ev.target.value)===2 ? 2 : 1;
+      jsonPending.diff = diffCourseLists(slotCourses(jsonPending.slot), jsonPending.courses);
+      renderJsonPreview();
+    });
+  });
+  $('btnJsonCancel').addEventListener('click', ()=>{
+    jsonPending = null; box.hidden = true; box.innerHTML = '';
+  });
+  $('btnJsonApply').addEventListener('click', applyJsonImport);
+}
+
+function applyJsonImport(){
+  const p = jsonPending;
+  if(!p){ toast('没有待写入的 JSON 数据','warn'); return; }
+  const slot = p.slot;
+  const slotName = slot===2 ? '对象课表' : '我的课表';
+  const modeEl = document.querySelector('input[name="jsonMode"]:checked');
+  const mode = modeEl ? modeEl.value : 'merge';
+  const oldList = slotCourses(slot).slice();
+  let nextList;
+
+  if(mode === 'replace'){
+    if(!confirm('整体替换【' + slotName + '】？\n当前 ' + oldList.length + ' 门 → 新数据 ' + p.courses.length
+      + ' 门；未出现在新数据里的课程会被删除。')) return;
+    nextList = p.courses.map(normCourse);
+  }else{
+    nextList = oldList.map(c=> Object.assign({}, c));
+    const index = new Map();
+    nextList.forEach((c,i)=> index.set(jsonIdentity(c), i));
+    // 只新增“确实不存在”的
+    p.diff.added.forEach(c=>{
+      const k = jsonIdentity(c);
+      if(index.has(k)) return;
+      nextList.push(normCourse(c));
+      index.set(k, nextList.length-1);
+    });
+    // 只更新 1:1 可靠匹配的；并再次核对现值，避免误改
+    p.diff.changed.forEach(ch=>{
+      const i = index.get(jsonIdentity(ch.before));
+      if(i == null) return;
+      const cur = nextList[i];
+      if(!sameCourseAttrs(cur, ch.before)) return;
+      nextList[i] = Object.assign({}, cur, {
+        name: ch.after.name, teacher: ch.after.teacher, location: ch.after.location,
+        day: ch.after.day, start: ch.after.start, end: ch.after.end,
+        weeksRaw: ch.after.weeksRaw,
+        color: (cur.color!=null ? cur.color : ch.after.color)
+      });
+    });
+  }
+
+  // 写入前备份到独立键（不改动原有数据）
+  try{
+    backupSlotBeforeWrite(slot);
+  }catch(e){
+    toast('无法创建导入前备份，已取消写入：' + (e && e.message ? e.message : e), 'err');
+    return;
+  }
+
+  const res = persistSlotChange(slot, nextList);
+  renderAll();
+  if(!res.ok){
+    if(res.restored){
+      toast('写入失败，已恢复原数据：' + (res.error && res.error.message ? res.error.message : res.error), 'err');
+    }else{
+      toast('写入失败，且自动回滚失败！本地存储可能仍是新数据；导入前备份已保存在浏览器中，请勿刷新页面，先导出备份或从导入前备份恢复。原始错误：'
+        + (res.error && res.error.message ? res.error.message : res.error)
+        + '；回滚错误：' + (res.restoreError && res.restoreError.message ? res.restoreError.message : res.restoreError), 'err');
+    }
+    return;
+  }
+  const summary = mode==='replace'
+    ? ('已整体替换为 ' + nextList.length + ' 门')
+    : ('新增 ' + p.diff.added.length + '、修改 ' + p.diff.changed.length + '、删除 0');
+  toast('已写入【' + slotName + '】：' + summary);
+  jsonPending = null;
+  const box = $('jsonPreview'); if(box){ box.hidden = true; box.innerHTML = ''; }
+  const dlg = $('importDlg'); if(dlg && dlg.open) dlg.close();
+  resetImportUI();
 }
 
 /* ---------- 周切换 ---------- */
@@ -1169,6 +1525,18 @@ function bindEvents(){
   });
   $('fileInput').addEventListener('change', ()=>{
     if($('fileInput').files[0]) analyzeFile($('fileInput').files[0]);
+  });
+  $('btnAnalyzeJson').addEventListener('click', ()=>{
+    analyzeJsonText($('jsonArea').value);
+  });
+  $('jsonFileInput').addEventListener('change', ()=>{
+    const f = $('jsonFileInput').files[0];
+    if(!f) return;
+    readFileText(f).then(text=>{
+      $('jsonArea').value = text;
+      analyzeJsonText(text);
+    }).catch(e=> toast('读取 JSON 文件失败：' + (e && e.message ? e.message : e), 'err'));
+    $('jsonFileInput').value = '';
   });
   $('btnConfirmImport').addEventListener('click', confirmImport);
   $('btnCancelImport').addEventListener('click', ()=>{ $('importDlg').close(); resetImportUI(); });
